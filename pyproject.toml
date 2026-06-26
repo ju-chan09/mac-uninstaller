@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "mac-uninstall"
+version = "1.0.0"
+description = "macOS app cleaner for the terminal — like AppCleaner, but in your shell"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = ["rich>=13"]
+
+[project.urls]
+Homepage = "https://github.com/ju-chan09/mac-uninstall"
+Repository = "https://github.com/ju-chan09/mac-uninstall"
+
+[project.scripts]
+uninstall = "mac_uninstall:main"
+
+[tool.setuptools]
+py-modules = ["mac_uninstall"]
