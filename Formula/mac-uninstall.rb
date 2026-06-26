@@ -4,7 +4,7 @@ class MacUninstall < Formula
   desc "macOS app cleaner for the terminal — remove apps and their leftovers"
   homepage "https://github.com/ju-chan09/mac-uninstaller"
   url "https://github.com/ju-chan09/mac-uninstaller/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "d5558cd419c8d46bdc958064cb97f963d1ea793866414c025906ec15033512ed"
+  sha256 "cdd43b586a60e8857aa838af1abdf9a778b47b826bee002e10f945119801a9eb"
   license "MIT"
   head "https://github.com/ju-chan09/mac-uninstaller.git", branch: "main"
 
