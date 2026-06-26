@@ -1,0 +1,1262 @@
+#!/usr/bin/env python3
+# uninstall — macOS app cleaner for the terminal
+
+__version__ = "1.0.0"
+
+import os
+import sys
+import shutil
+import subprocess
+import signal
+import termios
+import tty
+import time
+import select as _select
+import difflib
+import shlex
+import plistlib
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+
+# ── dependency bootstrap ──────────────────────────────────────────────────────
+
+def _ensure_rich():
+    try:
+        from rich.console import Console  # noqa
+    except ImportError:
+        print("Installing 'rich'…", flush=True)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--user", "rich"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+_ensure_rich()
+
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich import box
+
+console = Console()
+HOME = Path.home()
+
+
+# ── formatting ────────────────────────────────────────────────────────────────
+
+def fmt_size(n: int) -> str:
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+def path_size(p: Path) -> int:
+    try:
+        if p.is_symlink():
+            return 0
+        if p.is_file():
+            return p.stat().st_size
+        total = 0
+        for e in p.rglob("*"):
+            try:
+                if e.is_file() and not e.is_symlink():
+                    total += e.stat().st_size
+            except (OSError, PermissionError):
+                pass
+        return total
+    except (OSError, PermissionError):
+        return 0
+
+def short_path(p: Path) -> str:
+    s = str(p)
+    return ("~" + s[len(str(HOME)):]) if s.startswith(str(HOME)) else s
+
+
+# ── app discovery ─────────────────────────────────────────────────────────────
+
+USER_APP_DIRS = [
+    Path("/Applications"),
+    HOME / "Applications",
+    Path("/Applications/Utilities"),
+]
+
+SYSTEM_APP_DIRS = [
+    Path("/System/Applications"),
+    Path("/System/Applications/Utilities"),
+]
+
+ALL_APP_DIRS = USER_APP_DIRS + SYSTEM_APP_DIRS
+
+def is_system_app(path: Path) -> bool:
+    return str(path).startswith("/System/")
+
+def _is_apple_app(app: Path) -> bool:
+    """True if the bundle ID starts with com.apple. — built-in Apple apps."""
+    try:
+        with open(app / "Contents" / "Info.plist", "rb") as f:
+            bid = plistlib.load(f).get("CFBundleIdentifier", "")
+        return isinstance(bid, str) and bid.startswith("com.apple.")
+    except Exception:
+        return False
+
+def list_apps() -> List[Path]:
+    """User-installed apps only — system apps excluded."""
+    apps, seen = [], set()
+    for d in USER_APP_DIRS:
+        if not d.exists():
+            continue
+        for app in sorted(d.iterdir(), key=lambda p: p.stem.lower()):
+            if app.suffix == ".app" and str(app) not in seen:
+                seen.add(str(app))
+                apps.append(app)
+    return sorted(apps, key=lambda p: p.stem.lower())
+
+def find_app(name: str) -> Optional[Path]:
+    """Search all dirs including system (caller checks is_system_app)."""
+    name = name.rstrip("/")
+    p = Path(name)
+    if p.exists() and p.suffix == ".app":
+        return p
+    stem = (p.stem if p.suffix == ".app" else name).lower()
+    for d in ALL_APP_DIRS:
+        if not d.exists():
+            continue
+        for app in d.iterdir():
+            if app.suffix == ".app" and app.stem.lower() == stem:
+                return app
+    return None
+
+def suggest_app(name: str) -> Optional[Path]:
+    """Return the closest matching user app for a mistyped name."""
+    apps = list_apps()
+    if not apps:
+        return None
+    stems = {a.stem.lower(): a for a in apps}
+    matches = difflib.get_close_matches(name.lower(), stems.keys(), n=1, cutoff=0.5)
+    return stems[matches[0]] if matches else None
+
+def get_bundle_id(app: Path) -> Optional[str]:
+    try:
+        r = subprocess.run(
+            ["defaults", "read", str(app / "Contents" / "Info.plist"), "CFBundleIdentifier"],
+            capture_output=True, text=True, timeout=5,
+        )
+        v = r.stdout.strip()
+        return v or None
+    except Exception:
+        return None
+
+
+# ── homebrew cask detection ───────────────────────────────────────────────────
+
+CASKROOM_DIRS = [
+    Path("/opt/homebrew/Caskroom"),   # Apple Silicon
+    Path("/usr/local/Caskroom"),      # Intel
+    HOME / "Library/Caskroom",
+]
+
+def _norm_cask(s: str) -> str:
+    return s.lower().replace("-", "").replace(" ", "").replace("_", "")
+
+def find_brew_cask(app_name: str) -> Optional[str]:
+    """Return the brew cask token if this app is managed by Homebrew, else None."""
+    if not shutil.which("brew"):
+        return None
+    norm = _norm_cask(app_name)
+    # Fast path: Caskroom directories don't need a subprocess
+    for caskroom in CASKROOM_DIRS:
+        if not caskroom.exists():
+            continue
+        try:
+            for entry in caskroom.iterdir():
+                if _norm_cask(entry.name) == norm:
+                    return entry.name
+        except OSError:
+            pass
+    # Fallback: ask brew for installed casks
+    try:
+        r = subprocess.run(["brew", "list", "--cask"], capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        casks = r.stdout.strip().split()
+        for cask in casks:
+            if _norm_cask(cask) == norm:
+                return cask
+        for cask in casks:
+            nc = _norm_cask(cask)
+            if norm in nc or nc in norm:
+                return cask
+    except Exception:
+        pass
+    return None
+
+def scan_brew_cask(token: str) -> List[Tuple[Path, str]]:
+    """Return Caskroom directory for this token if it exists."""
+    for caskroom in CASKROOM_DIRS:
+        d = caskroom / token
+        if d.exists():
+            return [(d, "Homebrew Caskroom")]
+    return []
+
+
+# ── leftover file scanner ─────────────────────────────────────────────────────
+
+CATEGORY_STYLE = {
+    "App Bundle":             "bold red",
+    "App Support":            "yellow",
+    "App Support (system)":   "yellow",
+    "App Scripts":            "dim yellow",
+    "Cache":                  "dark_orange",
+    "Cache (system)":         "dark_orange",
+    "Logs":                   "cyan",
+    "Crash Reports":          "bright_red",
+    "Container":              "magenta",
+    "Daemon Container":       "magenta",
+    "Group Container":        "bright_magenta",
+    "Preferences":            "bright_cyan",
+    "Preferences/ByHost":     "bright_cyan",
+    "Preferences (system)":   "bright_cyan",
+    "Saved State":            "blue",
+    "WebKit":                 "purple4",
+    "HTTP Storage":           "green4",
+    "Cookies":                "spring_green3",
+    "Launch Agent":           "bold yellow",
+    "Launch Agent (system)":  "bold yellow",
+    "Launch Daemon":          "bold red",
+    "Helper Tool":            "bold red",
+    "Kernel Extension":       "bold red",
+    "PreferencePane":         "bright_cyan",
+    "Screen Saver":           "blue",
+    "QuickLook":              "dim",
+    "Spotlight":              "dim",
+    "Audio Plugin":           "bright_magenta",
+    "Internet Plug-In":       "dim",
+    "Services":               "dim",
+    "Input Method":           "dim",
+    "Automator":              "dim",
+    "Color Picker":           "dim",
+    "XDG Config":             "dim",
+    "Receipts":               "grey50",
+}
+
+def scan(app_name: str, bid: Optional[str]) -> List[Tuple[Path, str]]:
+    hits: List[Tuple[Path, str]] = []
+    seen: set = set()
+
+    def add(path: Path, cat: str):
+        key = str(path.resolve() if not path.is_symlink() else path)
+        if key not in seen and path.exists():
+            seen.add(key)
+            hits.append((path, cat))
+
+    bid_parts = bid.split(".") if bid else []
+    short = bid_parts[-1] if bid_parts else app_name.split()[-1]
+    names = list({app_name, short} - {""})
+
+    def glob_dir(base: Path, cat: str, *pats: str):
+        if not base.exists():
+            return
+        for pat in pats:
+            if not pat:
+                continue
+            if (base / pat).exists():
+                add(base / pat, cat)
+            for m in base.glob(f"{pat}*"):
+                add(m, cat)
+
+    def glob_plist(base: Path, cat: str, *pats: str):
+        if not base.exists():
+            return
+        for pat in pats:
+            if not pat:
+                continue
+            for m in base.glob(f"{pat}*.plist"):
+                add(m, cat)
+            for m in base.glob(f"*{pat}*.plist"):
+                add(m, cat)
+
+    # ── Application Support ───────────────────────────────────────────────────
+    glob_dir(HOME / "Library/Application Support",   "App Support",          *names, *([ bid] if bid else []))
+    glob_dir(Path("/Library/Application Support"),   "App Support (system)", *names, *([bid] if bid else []))
+
+    # ── Application Scripts ───────────────────────────────────────────────────
+    if bid:
+        glob_dir(HOME / "Library/Application Scripts", "App Scripts", bid)
+
+    # ── Caches ────────────────────────────────────────────────────────────────
+    glob_dir(HOME / "Library/Caches",      "Cache",          *names, *([bid] if bid else []))
+    glob_dir(Path("/Library/Caches"),      "Cache (system)", *names, *([bid] if bid else []))
+
+    # ── Logs ──────────────────────────────────────────────────────────────────
+    glob_dir(HOME / "Library/Logs",  "Logs", *names, *([bid] if bid else []))
+    glob_dir(Path("/Library/Logs"),  "Logs", *names, *([bid] if bid else []))
+
+    # ── Crash reports ─────────────────────────────────────────────────────────
+    for cd in [HOME / "Library/Logs/DiagnosticReports",
+               Path("/Library/Logs/DiagnosticReports")]:
+        if cd.exists():
+            for n in names:
+                for m in cd.glob(f"{n}*"):
+                    add(m, "Crash Reports")
+
+    # ── Preferences ───────────────────────────────────────────────────────────
+    glob_plist(HOME / "Library/Preferences",          "Preferences",          *([bid] if bid else []), *names)
+    glob_plist(HOME / "Library/Preferences/ByHost",   "Preferences/ByHost",   *([bid] if bid else []))
+    glob_plist(Path("/Library/Preferences"),           "Preferences (system)", *([bid] if bid else []))
+
+    # ── Containers ────────────────────────────────────────────────────────────
+    if bid:
+        glob_dir(HOME / "Library/Containers",        "Container",        bid)
+        glob_dir(HOME / "Library/Daemon Containers", "Daemon Container", bid)
+
+    # ── Group Containers ──────────────────────────────────────────────────────
+    gc = HOME / "Library/Group Containers"
+    if gc.exists() and bid:
+        bl, sl = bid.lower(), short.lower()
+        for m in gc.iterdir():
+            nl = m.name.lower()
+            if bl in nl or sl in nl:
+                add(m, "Group Container")
+
+    # ── Saved Application State ───────────────────────────────────────────────
+    if bid:
+        add(HOME / "Library/Saved Application State" / f"{bid}.savedState", "Saved State")
+
+    # ── WebKit / HTTP / Cookies ───────────────────────────────────────────────
+    if bid:
+        glob_dir(HOME / "Library/WebKit",       "WebKit",       bid)
+        glob_dir(HOME / "Library/HTTPStorages", "HTTP Storage", bid)
+        add(HOME / "Library/Cookies" / f"{bid}.binarycookies", "Cookies")
+
+    # ── Launch Agents / Daemons ───────────────────────────────────────────────
+    if bid:
+        for la in [HOME / "Library/LaunchAgents", Path("/Library/LaunchAgents")]:
+            cat = "Launch Agent" if str(la).startswith(str(HOME)) else "Launch Agent (system)"
+            if la.exists():
+                for m in la.glob(f"{bid}*.plist"):
+                    add(m, cat)
+        ld = Path("/Library/LaunchDaemons")
+        if ld.exists():
+            for m in ld.glob(f"{bid}*.plist"):
+                add(m, "Launch Daemon")
+
+    # ── Privileged Helper Tools ───────────────────────────────────────────────
+    pht = Path("/Library/PrivilegedHelperTools")
+    if pht.exists() and bid:
+        for m in pht.glob(f"{bid}*"):
+            add(m, "Helper Tool")
+
+    # ── Kernel Extensions ─────────────────────────────────────────────────────
+    for ke in [Path("/Library/Extensions"), Path("/System/Library/Extensions")]:
+        if ke.exists():
+            for n in names:
+                for m in ke.glob(f"{n}*.kext"):
+                    add(m, "Kernel Extension")
+            if bid:
+                for m in ke.glob(f"{bid}*.kext"):
+                    add(m, "Kernel Extension")
+
+    # ── Preference Panes ──────────────────────────────────────────────────────
+    for pp in [HOME / "Library/PreferencePanes", Path("/Library/PreferencePanes")]:
+        if pp.exists():
+            for n in names:
+                for m in pp.glob(f"{n}*.prefPane"):
+                    add(m, "PreferencePane")
+
+    # ── Screen Savers ─────────────────────────────────────────────────────────
+    for ss in [HOME / "Library/Screen Savers", Path("/Library/Screen Savers")]:
+        if ss.exists():
+            for n in names:
+                for m in ss.glob(f"{n}*.saver"):
+                    add(m, "Screen Saver")
+
+    # ── Audio Plug-ins (VST/VST3/AU/CLAP/AAX) ────────────────────────────────
+    audio_dirs = [
+        HOME / "Library/Audio/Plug-Ins/Components",
+        HOME / "Library/Audio/Plug-Ins/VST",
+        HOME / "Library/Audio/Plug-Ins/VST3",
+        HOME / "Library/Audio/Plug-Ins/CLAP",
+        Path("/Library/Audio/Plug-Ins/Components"),
+        Path("/Library/Audio/Plug-Ins/VST"),
+        Path("/Library/Audio/Plug-Ins/VST3"),
+        Path("/Library/Audio/Plug-Ins/CLAP"),
+    ]
+    audio_exts = ("*.component", "*.vst", "*.vst3", "*.clap", "*.aaxplugin")
+    for ad in audio_dirs:
+        if not ad.exists():
+            continue
+        for n in names:
+            for ext in audio_exts:
+                for m in ad.glob(f"{n}{ext}"):
+                    add(m, "Audio Plugin")
+
+    # ── QuickLook Generators ──────────────────────────────────────────────────
+    for ql in [HOME / "Library/QuickLook", Path("/Library/QuickLook")]:
+        if ql.exists():
+            for n in names:
+                for m in ql.glob(f"{n}*.qlgenerator"):
+                    add(m, "QuickLook")
+
+    # ── Spotlight Importers ───────────────────────────────────────────────────
+    for sp in [HOME / "Library/Spotlight", Path("/Library/Spotlight")]:
+        if sp.exists():
+            for n in names:
+                for m in sp.glob(f"{n}*.mdimporter"):
+                    add(m, "Spotlight")
+
+    # ── Internet Plug-ins ─────────────────────────────────────────────────────
+    for ip in [HOME / "Library/Internet Plug-Ins", Path("/Library/Internet Plug-Ins")]:
+        if ip.exists():
+            for n in names:
+                for m in ip.glob(f"{n}*"):
+                    add(m, "Internet Plug-In")
+
+    # ── Services ──────────────────────────────────────────────────────────────
+    for sv in [HOME / "Library/Services", Path("/Library/Services")]:
+        if sv.exists():
+            for n in names:
+                for m in sv.glob(f"{n}*"):
+                    add(m, "Services")
+
+    # ── Automator Actions ─────────────────────────────────────────────────────
+    for am in [HOME / "Library/Automator", Path("/Library/Automator")]:
+        if am.exists():
+            for n in names:
+                for m in am.glob(f"{n}*.action"):
+                    add(m, "Automator")
+
+    # ── Input Methods ─────────────────────────────────────────────────────────
+    im = HOME / "Library/Input Methods"
+    if im.exists():
+        for n in names:
+            for m in im.glob(f"{n}*.app"):
+                add(m, "Input Method")
+
+    # ── Color Pickers ─────────────────────────────────────────────────────────
+    for cp in [HOME / "Library/ColorPickers", Path("/Library/ColorPickers")]:
+        if cp.exists():
+            for n in names:
+                for m in cp.glob(f"{n}*.colorPicker"):
+                    add(m, "Color Picker")
+
+    # ── XDG config (~/.config) ────────────────────────────────────────────────
+    config = HOME / ".config"
+    if config.exists():
+        for n in names:
+            for candidate in [config / n, config / n.lower()]:
+                if candidate.exists():
+                    add(candidate, "XDG Config")
+
+    # ── Package Receipts ──────────────────────────────────────────────────────
+    receipts = Path("/private/var/db/receipts")
+    if receipts.exists() and bid:
+        for m in receipts.glob(f"{bid}*"):
+            add(m, "Receipts")
+
+    return hits
+
+
+# ── table renderer ────────────────────────────────────────────────────────────
+
+def render_table(all_items: List[Tuple[Path, str]]) -> int:
+    tbl = Table(
+        box=box.ROUNDED,
+        border_style="bright_black",
+        header_style="bold on grey11",
+        padding=(0, 1),
+        expand=True,
+        show_lines=False,
+    )
+    tbl.add_column("#", width=4, justify="right", style="dim")
+    tbl.add_column("Category", min_width=20)
+    tbl.add_column("Path")
+    tbl.add_column("Size", justify="right", min_width=9)
+
+    total = 0
+    for i, (path, cat) in enumerate(all_items, 1):
+        sz = path_size(path)
+        total += sz
+        color = CATEGORY_STYLE.get(cat, "white")
+        size_style = "bold green" if sz > 50*1024*1024 else ("green" if sz > 0 else "dim")
+        tbl.add_row(
+            str(i),
+            Text(cat, style=color),
+            Text(short_path(path), overflow="fold"),
+            Text(fmt_size(sz), style=size_style),
+        )
+
+    console.print(tbl)
+    return total
+
+
+# ── file operations ───────────────────────────────────────────────────────────
+
+def _requires_admin(path: Path) -> bool:
+    s = str(path)
+    return s.startswith("/Library/") or s.startswith("/private/var/") or s.startswith("/usr/")
+
+def _is_protected_bundle(path: Path) -> bool:
+    """True for .app bundles outside the user's home — macOS App Management applies."""
+    return path.suffix == ".app" and not str(path).startswith(str(HOME))
+
+def _is_container_path(path: Path) -> bool:
+    """True for App Store sandbox containers — protected by FDA, not admin."""
+    s = str(path)
+    return s.startswith(str(HOME / "Library/Containers/")) or \
+           s.startswith(str(HOME / "Library/Group Containers/")) or \
+           s.startswith(str(HOME / "Library/Daemon Containers/"))
+
+def _terminal_name() -> str:
+    t = os.environ.get("TERM_PROGRAM", "").lower()
+    for name, label in [("ghostty", "Ghostty"), ("iterm", "iTerm2"),
+                         ("apple_terminal", "Terminal"), ("kitty", "kitty"),
+                         ("warp", "Warp"), ("hyper", "Hyper")]:
+        if name in t:
+            return label
+    return "your terminal"
+
+def _osascript_rm_batch(paths: List[Path]) -> List[Tuple[bool, str]]:
+    """Delete multiple paths via one admin-auth dialog."""
+    cmds = "; ".join(f"rm -rf {shlex.quote(str(p))}" for p in paths)
+    r = subprocess.run(
+        ["osascript", "-e", f'do shell script "{cmds}" with administrator privileges'],
+        capture_output=True, timeout=120,
+    )
+    err = r.stderr.decode(errors="replace").strip() or "admin delete failed"
+    return [(not p.exists(), "" if not p.exists() else err) for p in paths]
+
+def move_to_trash(path: Path) -> Tuple[bool, str]:
+    """Move to ~/.Trash directly — no Finder automation."""
+    # Protected bundles in /Applications need admin mv; skip to avoid the
+    # "Terminal was prevented from modifying apps" notification.
+    if _is_protected_bundle(path):
+        return False, "app bundle in /Applications requires admin access"
+    try:
+        dest = HOME / ".Trash" / path.name
+        n = 1
+        while dest.exists():
+            dest = HOME / ".Trash" / f"{path.stem} ({n}){path.suffix}"
+            n += 1
+        shutil.move(str(path), str(dest))
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+def _trash_admin_batch(paths: List[Path]) -> List[Tuple[bool, str]]:
+    """Move multiple paths to Trash via one admin-auth dialog."""
+    trash = shlex.quote(str(HOME / ".Trash"))
+    cmds = "; ".join(f"mv {shlex.quote(str(p))} {trash}/" for p in paths)
+    r = subprocess.run(
+        ["osascript", "-e",
+         f'do shell script "{cmds}" with administrator privileges'],
+        capture_output=True, timeout=60,
+    )
+    err = r.stderr.decode(errors="replace").strip() or "admin move failed"
+    return [(not p.exists(), "" if not p.exists() else err) for p in paths]
+
+def delete_permanent(path: Path) -> Tuple[bool, str]:
+    """Delete without admin. Protected .app bundles skip direct delete to avoid
+    triggering the macOS App Management notification."""
+    if _is_protected_bundle(path):
+        return False, "App bundle in /Applications requires admin access"
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(str(path))
+        else:
+            path.unlink()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+# ── keyboard input ────────────────────────────────────────────────────────────
+
+def _open_tty():
+    try:
+        return open("/dev/tty", "rb", buffering=0)
+    except OSError:
+        console.print()
+        console.print("[red]✗[/]  No interactive terminal — run [bold]uninstall[/] directly in Ghostty, Terminal, or iTerm2.")
+        console.print()
+        sys.exit(1)
+
+def read_key() -> str:
+    with _open_tty() as f:
+        fd = f.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = f.read(1)
+            if ch == b"\x1b":
+                if _select.select([f], [], [], 0.05)[0]:
+                    rest = f.read(2)
+                    if rest == b"[A": return "UP"
+                    if rest == b"[B": return "DOWN"
+                    if rest == b"[5": f.read(1); return "PGUP"
+                    if rest == b"[6": f.read(1); return "PGDN"
+                return "ESC"
+            if ch in (b"\r", b"\n"): return "ENTER"
+            if ch == b"\x03":        return "CTRL_C"
+            if ch == b"\x7f":        return "BACKSPACE"
+            decoded = ch.decode("utf-8", errors="replace")
+            return decoded.upper()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+# ── terminal helpers ──────────────────────────────────────────────────────────
+
+def term_height() -> int:
+    try:
+        return os.get_terminal_size().lines
+    except OSError:
+        return 24
+
+def term_width() -> int:
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return 80
+
+def clear_lines(n: int):
+    if n > 0:
+        console.file.flush()
+        sys.stdout.write(f"\x1b[{n}F\x1b[J")
+        sys.stdout.flush()
+
+
+# ── app browser ───────────────────────────────────────────────────────────────
+
+def browser(preview: bool = False) -> Optional[Path]:
+    all_apps = list_apps()
+    if not preview:
+        all_apps = [a for a in all_apps if not _is_apple_app(a)]
+    if not all_apps:
+        console.print("[red]✗[/]  No apps found.")
+        return None
+
+    query = ""
+    filtered = all_apps[:]
+    sel = 0
+    offset = 0
+    lines_drawn = 0
+
+    def filter_apps(q: str) -> List[Path]:
+        if not q:
+            return all_apps[:]
+        ql = q.lower()
+        return [a for a in all_apps if ql in a.stem.lower()]
+
+    def draw():
+        nonlocal offset, lines_drawn
+        rows = min(15, max(4, term_height() - 7))
+
+        # Clamp selection into view
+        if sel < offset:
+            offset = sel
+        elif sel >= offset + rows:
+            offset = sel - rows + 1
+
+        clear_lines(lines_drawn)
+        drawn = 0
+        w = term_width()
+
+        # Search bar
+        if query:
+            console.print(f"  [dim]Search:[/] [bold white]{query}[/][blink]█[/]  [dim]{len(filtered)} result{'s' if len(filtered)!=1 else ''}[/]")
+        else:
+            console.print(f"  [dim]Type to search · ↑↓ navigate · ↵ select · Q quit[/]")
+        drawn += 1
+
+        console.print()
+        drawn += 1
+
+        # App rows
+        visible = filtered[offset:offset + rows]
+        for i, app in enumerate(visible):
+            idx = offset + i
+            is_sel = (idx == sel)
+            parent = str(app.parent).replace(str(HOME), "~")
+            name_col = app.stem
+
+            if is_sel:
+                # Pad to fill width for highlight bar feel
+                pad = max(0, w - len(name_col) - len(parent) - 9)
+                console.print(
+                    f"  [bold white on grey15] ❯  {name_col}[/]"
+                    f"[dim on grey15]{'':>{pad}}{parent} [/]"
+                )
+            else:
+                console.print(f"     [white]{name_col}[/]  [dim]{parent}[/]")
+            drawn += 1
+
+        console.print()
+        mode = "[dim]preview mode[/]" if preview else ""
+        count_str = f"[dim]{len(all_apps)} apps[/]"
+        console.print(f"  {count_str}  {mode}")
+        drawn += 2
+
+        lines_drawn = drawn
+
+    draw()
+
+    while True:
+        key = read_key()
+
+        if key in ("Q", "ESC", "CTRL_C"):
+            clear_lines(lines_drawn)
+            return None
+
+        elif key == "ENTER":
+            if filtered:
+                clear_lines(lines_drawn)
+                return filtered[sel]
+
+        elif key == "UP":
+            if filtered:
+                sel = max(0, sel - 1)
+                draw()
+
+        elif key == "DOWN":
+            if filtered:
+                sel = min(len(filtered) - 1, sel + 1)
+                draw()
+
+        elif key == "PGUP":
+            if filtered:
+                rows = min(15, max(4, term_height() - 7))
+                sel = max(0, sel - rows)
+                draw()
+
+        elif key == "PGDN":
+            if filtered:
+                rows = min(15, max(4, term_height() - 7))
+                sel = min(len(filtered) - 1, sel + rows)
+                draw()
+
+        elif key == "BACKSPACE":
+            if query:
+                query = query[:-1]
+                filtered = filter_apps(query)
+                sel = 0
+                offset = 0
+                draw()
+
+        elif len(key) == 1 and (key.isalpha() or key.isdigit() or key in " .-_"):
+            query += key.lower()
+            filtered = filter_apps(query)
+            sel = 0
+            offset = 0
+            draw()
+
+
+# ── action menu ───────────────────────────────────────────────────────────────
+
+def action_menu(has_brew: bool = False) -> str:
+    """Returns: 'brew' | 'trash' | 'delete' | 'cancel'"""
+    items: List[Tuple[str, str, str, str]] = []
+    if has_brew:
+        items.append(("Uninstall via Homebrew", "removes cask + runs cleanup", "bright_green", "brew"))
+    items.extend([
+        ("Move to Trash",      "safer — recoverable from Finder", "green", "trash"),
+        ("Delete permanently", "no undo",                        "red",   "delete"),
+        ("Cancel",             "",                               "",      "cancel"),
+    ])
+
+    sel = 0
+
+    def draw():
+        for i, (label, desc, color, _) in enumerate(items):
+            if i == sel:
+                line = f"  [bold white]❯[/]  [bold {color}]{label}[/]"
+                if desc:
+                    line += f"   [dim]{desc}[/]"
+            else:
+                line = f"     [dim]{label}[/]"
+            console.print(line)
+
+    draw()
+    while True:
+        key = read_key()
+        moved = False
+        if key == "UP":
+            sel = (sel - 1) % len(items); moved = True
+        elif key == "DOWN":
+            sel = (sel + 1) % len(items); moved = True
+        elif key == "ENTER":
+            break
+        elif key == "B" and has_brew:
+            sel = 0; break
+        elif key == "T":
+            sel = next(i for i, item in enumerate(items) if item[3] == "trash"); break
+        elif key == "D":
+            sel = next(i for i, item in enumerate(items) if item[3] == "delete"); break
+        elif key in ("N", "ESC", "CTRL_C"):
+            sel = next(i for i, item in enumerate(items) if item[3] == "cancel"); break
+        else:
+            continue
+        if moved:
+            clear_lines(len(items))
+            draw()
+
+    clear_lines(len(items))
+    label, desc, color, action = items[sel]
+    line = f"  [bold white]❯[/]  [bold {color}]{label}[/]"
+    if desc:
+        line += f"   [dim]{desc}[/]"
+    console.print(line)
+    console.print()
+    return action
+
+
+# ── delete / trash flows ──────────────────────────────────────────────────────
+
+def _show_fda_hint(container_fails: List[Tuple[Path, str]]):
+    n = len(container_fails)
+    term = _terminal_name()
+    console.print(
+        f"  [yellow]⚠[/]  {n} App Store sandbox container{'s' if n!=1 else ''} could not be deleted  "
+        f"[dim](admin access doesn't help here)[/]"
+    )
+    console.print(
+        f"  [dim]Grant [bold]Full Disk Access[/] to {term}: "
+        f"System Settings → Privacy & Security → Full Disk Access[/]"
+    )
+    console.print()
+
+def _show_error_prompt(failures: List[Tuple[str, str]]):
+    n = len(failures)
+    console.print(
+        f"  [dim]Press [bold white]?[/] for details on {n} failed item{'s' if n!=1 else ''}, or any key to continue[/]  ",
+        end="",
+    )
+    console.file.flush()
+    key = read_key()
+    console.print()
+    console.print()
+    if key == "?":
+        console.rule("[dim]Error details[/]", style="bright_black")
+        console.print()
+        for path_str, reason in failures:
+            console.print(f"  [yellow]⚠[/]  [dim]{path_str}[/]")
+            if reason:
+                console.print(f"     [dim red]{reason}[/]")
+        console.print()
+
+def _ask_admin_retry(first_failures: List[Tuple[Path, str]]) -> bool:
+    n = len(first_failures)
+    console.print(
+        f"  [yellow]⚠[/]  {n} item{'s' if n!=1 else ''} failed — "
+        f"[dim]retry with administrator access?[/]  [bold]Y[/] [dim]/ N[/]  ",
+        end="",
+    )
+    console.file.flush()
+    key = read_key()
+    console.print()
+    console.print()
+    return key == "Y"
+
+def do_trash(all_items: List[Tuple[Path, str]], total_size: int):
+    console.rule("[bold]Moving to Trash[/]", style="bright_black")
+    console.print()
+    ok = 0
+    first_failures: List[Tuple[Path, str]] = []
+
+    with Progress(SpinnerColumn(style="green"), TextColumn("[green]{task.description}"),
+                  console=console, transient=True) as prog:
+        task = prog.add_task("", total=len(all_items))
+        for path, _ in all_items:
+            prog.update(task, description=f"Trashing [dim]{path.name}[/]…")
+            success, err = move_to_trash(path)
+            if success:
+                ok += 1
+            else:
+                first_failures.append((path, err))
+            prog.advance(task)
+
+    final_failures: List[Tuple[str, str]] = []
+    first_failures = [(p, e) for p, e in first_failures if p.exists()]
+    container_fails = [(p, e) for p, e in first_failures if _is_container_path(p)]
+    admin_retryable  = [(p, e) for p, e in first_failures if not _is_container_path(p)]
+
+    if admin_retryable and _ask_admin_retry(admin_retryable):
+        paths_to_retry = [p for p, _ in admin_retryable]
+        err_by_path = {p: e for p, e in admin_retryable}
+        with Progress(SpinnerColumn(style="yellow"), TextColumn("[yellow]{task.description}"),
+                      console=console, transient=True) as prog:
+            prog.add_task(f"Trashing {len(paths_to_retry)} items (admin)…")
+        results = _trash_admin_batch(paths_to_retry)
+        for path, (success, err) in zip(paths_to_retry, results):
+            if success:
+                ok += 1
+            else:
+                final_failures.append((short_path(path), err or err_by_path.get(path, "")))
+    elif admin_retryable:
+        final_failures = [(short_path(p), e) for p, e in admin_retryable]
+
+    if container_fails:
+        final_failures += [(short_path(p), e) for p, e in container_fails]
+
+    msg = f"  [bold green]✓[/]  {ok} item{'s' if ok!=1 else ''} moved to Trash"
+    if final_failures:
+        msg += f"  [dim]· {len(final_failures)} failed[/]"
+    msg += f"  [green]({fmt_size(total_size)} freed)[/]"
+    console.print(msg)
+    console.print()
+    if container_fails:
+        _show_fda_hint(container_fails)
+    if final_failures:
+        _show_error_prompt(final_failures)
+
+def do_delete(all_items: List[Tuple[Path, str]], count: int, total_size: int):
+    console.rule("[bold red]Permanent Delete[/]", style="red")
+    console.print()
+    console.print(f"  [bold red]⚠  {count} items · {fmt_size(total_size)}[/]  [dim]cannot be undone[/]")
+    console.print()
+    console.print("  [dim]Press [/][bold]Y[/][dim] to confirm, any other key to cancel:[/]  ", end="")
+    console.file.flush()
+
+    key = read_key()
+    console.print()
+    console.print()
+
+    if key != "Y":
+        console.print("  [dim]Cancelled.[/]")
+        console.print()
+        return
+
+    ok = 0
+    first_failures: List[Tuple[Path, str]] = []
+
+    with Progress(SpinnerColumn(style="red"), TextColumn("[red]{task.description}"),
+                  console=console, transient=True) as prog:
+        task = prog.add_task("", total=len(all_items))
+        for path, _ in all_items:
+            prog.update(task, description=f"Deleting [dim]{path.name}[/]…")
+            success, err = delete_permanent(path)
+            if success:
+                ok += 1
+            else:
+                first_failures.append((path, err))
+            prog.advance(task)
+
+    final_failures: List[Tuple[str, str]] = []
+    first_failures = [(p, e) for p, e in first_failures if p.exists()]
+    container_fails = [(p, e) for p, e in first_failures if _is_container_path(p)]
+    admin_retryable  = [(p, e) for p, e in first_failures if not _is_container_path(p)]
+
+    if admin_retryable and _ask_admin_retry(admin_retryable):
+        paths_to_retry = [p for p, _ in admin_retryable]
+        err_by_path = {p: e for p, e in admin_retryable}
+        with Progress(SpinnerColumn(style="yellow"), TextColumn("[yellow]{task.description}"),
+                      console=console, transient=True) as prog:
+            prog.add_task(f"Deleting {len(paths_to_retry)} items (admin)…")
+        results = _osascript_rm_batch(paths_to_retry)
+        for path, (success, err) in zip(paths_to_retry, results):
+            if success:
+                ok += 1
+            else:
+                final_failures.append((short_path(path), err or err_by_path.get(path, "")))
+    elif admin_retryable:
+        final_failures = [(short_path(p), e) for p, e in admin_retryable]
+
+    if container_fails:
+        final_failures += [(short_path(p), e) for p, e in container_fails]
+
+    msg = f"  [bold red]✓[/]  {ok} item{'s' if ok!=1 else ''} permanently deleted"
+    if final_failures:
+        msg += f"  [dim]· {len(final_failures)} failed[/]"
+    msg += f"  [red]({fmt_size(total_size)} freed)[/]"
+    console.print(msg)
+    console.print()
+    if container_fails:
+        _show_fda_hint(container_fails)
+    if final_failures:
+        _show_error_prompt(final_failures)
+
+def do_brew_uninstall(token: str) -> bool:
+    console.rule("[bold bright_green]Uninstalling via Homebrew[/]", style="bright_green")
+    console.print()
+    result: List[subprocess.CompletedProcess] = []
+    with Progress(SpinnerColumn(style="bright_green"), TextColumn("[bright_green]{task.description}"),
+                  console=console, transient=True) as prog:
+        task = prog.add_task(f"brew uninstall --cask {token}…")
+        r = subprocess.run(
+            ["brew", "uninstall", "--cask", "--force", token],
+            capture_output=True, text=True, timeout=300,
+        )
+        result.append(r)
+        prog.update(task, description=f"brew cleanup {token}…")
+        subprocess.run(["brew", "cleanup", token], capture_output=True, text=True, timeout=60)
+
+    r = result[0]
+    if r.returncode == 0:
+        console.print(f"  [bold bright_green]✓[/]  Homebrew uninstalled [bold]{token}[/]")
+        console.print()
+        return True
+    err = (r.stderr + r.stdout).strip()
+    console.print(f"  [yellow]⚠[/]  brew uninstall failed: [dim]{err[:200]}[/]")
+    console.print()
+    return False
+
+
+# ── running app detection ────────────────────────────────────────────────────
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours to signal freely
+
+def get_running_pids(app_path: Path) -> List[int]:
+    """Return PIDs of processes running from within this app bundle."""
+    pids: set = set()
+    my_pid = os.getpid()
+
+    try:
+        r = subprocess.run(["pgrep", "-f", str(app_path)], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            for p in r.stdout.strip().split():
+                if p.isdigit() and int(p) != my_pid:
+                    pids.add(int(p))
+    except Exception:
+        pass
+
+    return sorted(pids)
+
+def quit_app(app_name: str, pids: List[int]):
+    with Progress(SpinnerColumn(style="yellow"), TextColumn("[yellow]{task.description}"),
+                  console=console, transient=True) as prog:
+        prog.add_task(f"Quitting {app_name}…")
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+        time.sleep(1.5)
+        alive = [p for p in pids if _pid_exists(p)]
+        for pid in alive:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+    alive = [p for p in pids if _pid_exists(p)]
+    if alive:
+        console.print(f"  [yellow]⚠[/]  Could not fully quit [bold]{app_name}[/] — proceeding anyway")
+    else:
+        console.print(f"  [green]✓[/]  [bold]{app_name}[/] quit")
+    console.print()
+
+
+# ── main run ──────────────────────────────────────────────────────────────────
+
+def run(app_path: Path, preview: bool = False):
+    app_name = app_path.stem
+    bid = get_bundle_id(app_path)
+
+    with Progress(SpinnerColumn(style="cyan"), TextColumn("[cyan]{task.description}"),
+                  console=console, transient=True) as prog:
+        prog.add_task("Scanning…")
+        leftovers = scan(app_name, bid)
+        cask_token = find_brew_cask(app_name)
+
+    if cask_token:
+        leftovers = scan_brew_cask(cask_token) + leftovers
+
+    header = f"[bold green]✓[/]  [bold]{app_name}[/]"
+    if bid:
+        header += f"  [dim]{bid}[/]"
+    if cask_token:
+        header += f"  [bright_green]· homebrew cask[/]"
+    console.print(header)
+    console.print()
+
+    all_items = [(app_path, "App Bundle")] + leftovers
+    total_size = render_table(all_items)
+    count = len(all_items)
+
+    console.print()
+    console.print(
+        f"  [bold white]{count}[/] item{'s' if count!=1 else ''}  ·  "
+        f"[bold white]{len(leftovers)}[/] leftover{'s' if len(leftovers)!=1 else ''}  ·  "
+        f"[bold green]{fmt_size(total_size)}[/]"
+    )
+    console.print()
+
+    if preview:
+        if cask_token:
+            console.print(f"  [dim]Homebrew cask detected: [bold]{cask_token}[/] — would uninstall via brew[/]")
+        console.print("  [dim]Preview — no files removed.[/]")
+        console.print()
+        return
+
+    pids = get_running_pids(app_path)
+    if pids:
+        pid_str = ", ".join(str(p) for p in pids[:3])
+        suffix = "…" if len(pids) > 3 else ""
+        console.print(
+            f"  [yellow]⚠[/]  [bold]{app_name}[/] is currently running  [dim](PID {pid_str}{suffix})[/]"
+        )
+        console.print(f"  [dim]Quit before uninstalling?  [bold]Y[/] / [bold]N[/][/]  ", end="")
+        console.file.flush()
+        key = read_key()
+        console.print()
+        console.print()
+        if key == "Y":
+            quit_app(app_name, pids)
+
+    console.rule(style="bright_black")
+    console.print()
+    if cask_token:
+        console.print("  [dim]↑ ↓ move   ↵ confirm   B brew   T trash   D delete   N cancel[/]")
+    else:
+        console.print("  [dim]↑ ↓ move   ↵ confirm   T trash   D delete   N cancel[/]")
+    console.print()
+
+    choice = action_menu(has_brew=bool(cask_token))
+
+    if choice == "brew":
+        do_brew_uninstall(cask_token)
+        with Progress(SpinnerColumn(style="cyan"), TextColumn("[cyan]{task.description}"),
+                      console=console, transient=True) as prog:
+            prog.add_task("Scanning for remaining files…")
+            remaining_leftovers = scan(app_name, bid)
+        remaining_leftovers = [(rp, c) for rp, c in remaining_leftovers if rp.exists()]
+        remaining_app = [(app_path, "App Bundle")] if app_path.exists() else []
+        remaining = remaining_app + remaining_leftovers
+        if remaining:
+            r_total = render_table(remaining)
+            r_count = len(remaining)
+            console.print()
+            console.print(
+                f"  [bold white]{r_count}[/] remaining item{'s' if r_count!=1 else ''}  ·  "
+                f"[bold green]{fmt_size(r_total)}[/]"
+            )
+            console.print()
+            console.rule(style="bright_black")
+            console.print()
+            console.print("  [dim]↑ ↓ move   ↵ confirm   T trash   D delete   N skip[/]")
+            console.print()
+            choice2 = action_menu(has_brew=False)
+            if choice2 == "trash":
+                do_trash(remaining, r_total)
+            elif choice2 == "delete":
+                do_delete(remaining, r_count, r_total)
+            else:
+                console.print("  [dim]Skipped.[/]")
+                console.print()
+        else:
+            console.print("  [bold green]✓[/]  No leftover files — completely clean!")
+            console.print()
+
+    elif choice == "trash":
+        do_trash(all_items, total_size)
+    elif choice == "delete":
+        do_delete(all_items, count, total_size)
+    else:
+        console.print("  [dim]Cancelled.[/]")
+        console.print()
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def _usage():
+    console.print()
+    console.print(Panel(
+        "[bold]uninstall[/] [dim][-p] [app-name][/]\n\n"
+        "Removes macOS apps and all their leftover files.\n"
+        "No arguments opens an interactive app browser.\n\n"
+        "[bold]Examples[/]\n"
+        "  [dim]uninstall[/]                    browse all installed apps\n"
+        "  [dim]uninstall Safari[/]              scan Safari directly\n"
+        "  [dim]uninstall -p[/]                  preview browser\n"
+        "  [dim]uninstall -p 'Google Chrome'[/]  preview without removing\n\n"
+        "[bold]Browser[/]\n"
+        "  [dim]↑ ↓[/]         navigate  ·  [dim]↵[/] select\n"
+        "  [dim]type[/]         filter by name  ·  [dim]Q / Esc[/] quit\n\n"
+        "[bold]Action menu[/]\n"
+        "  [bright_green]B[/]           Uninstall via Homebrew  [dim](if cask detected)[/]\n"
+        "  [green]T[/] / [dim]↵[/]      Move to Trash  [dim](recoverable)[/]\n"
+        "  [red]D[/]           Delete permanently  [dim](Y to confirm)[/]\n"
+        "  [dim]N[/]           Cancel",
+        title="[bold]uninstall[/]",
+        subtitle="[dim]like AppCleaner, in your terminal[/]",
+        border_style="bright_black",
+        padding=(1, 2),
+    ))
+    console.print()
+
+def main():
+    args = sys.argv[1:]
+
+    if args and args[0] in ("-h", "--help"):
+        _usage()
+        sys.exit(0)
+
+    if args and args[0] in ("-v", "--version"):
+        print(f"uninstall {__version__}")
+        sys.exit(0)
+
+    preview = False
+    if args and args[0] == "-p":
+        preview = True
+        args = args[1:]
+
+    signal.signal(signal.SIGINT,
+                  lambda *_: (console.print("\n\n  [dim]Cancelled.[/]\n"), sys.exit(0)))
+
+    # Header — shown once regardless of path
+    console.print()
+    console.print(Panel.fit(
+        "[bold white]uninstall[/]  [dim]macOS app cleaner[/]"
+        + ("  [dim italic]preview[/]" if preview else ""),
+        border_style="bright_black",
+        padding=(0, 2),
+    ))
+    console.print()
+
+    if args:
+        name = " ".join(args)
+        app_path = find_app(name)
+
+        if app_path and is_system_app(app_path):
+            console.print(f"[yellow]⚠[/]  [bold]{app_path.stem}[/] is a macOS system app and cannot be uninstalled.")
+            console.print()
+            sys.exit(1)
+
+        if app_path and not preview and _is_apple_app(app_path):
+            console.print(f"[yellow]⚠[/]  [bold]{app_path.stem}[/] is a built-in Apple app and cannot be uninstalled.")
+            console.print()
+            sys.exit(1)
+
+        if not app_path:
+            console.print(f"[red]✗[/]  [bold]{name}[/] not found.")
+            suggestion = suggest_app(name)
+            if suggestion:
+                console.print()
+                console.print(f"  Did you mean [bold]{suggestion.stem}[/]?  [dim]Y / N[/]  ", end="")
+                console.file.flush()
+                key = read_key()
+                console.print()
+                console.print()
+                if key == "Y":
+                    run(suggestion, preview=preview)
+                    return
+            console.print()
+            sys.exit(1)
+
+        run(app_path, preview=preview)
+    else:
+        app_path = browser(preview=preview)
+        if app_path:
+            run(app_path, preview=preview)
+
+if __name__ == "__main__":
+    main()
